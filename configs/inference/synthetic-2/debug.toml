@@ -1,0 +1,13 @@
+model_name = "Qwen/Qwen3-0.6B"
+
+max_model_len = 8192
+total_step = 5
+toploc = true
+
+[monitor.file]
+enable = true
+path = "outputs/file_monitor.jsonl"
+
+[sampling]
+max_tokens = 1000
+n = 1

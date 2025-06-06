@@ -9,6 +9,8 @@ from prime_iroh import Node
 from pydantic_config import BaseConfig
 from safetensors.torch import load, save
 from vllm import LLM
+from vllm.distributed.parallel_state import get_tp_group
+from vllm.executor.mp_distributed_executor import MultiprocessingDistributedExecutor
 from vllm.model_executor.layers.sampler import SamplerOutput
 
 from zeroband.inference.utils import rgetattr
@@ -35,9 +37,19 @@ class PipelineConfig(BaseConfig):
     connection_num_retries: int = 10  # Each retry takes ~30s, so 10 retries is ~300s (5min)
 
     @property
-    def pipeline_enabled(self) -> bool:
+    def is_enabled(self) -> bool:
         """Returns True if pipeline parallelism is enabled (world_size > 1)."""
         return self.world_size > 1
+
+    @property
+    def is_first_stage(self) -> bool:
+        """Returns True if the current rank is the first rank."""
+        return self.rank == 0
+
+    @property
+    def is_last_stage(self) -> bool:
+        """Returns True if the current rank is the last rank."""
+        return self.rank == self.world_size - 1
 
 
 def serialize_tensors(tensor_dict: dict[str, torch.Tensor]) -> bytes:
@@ -74,7 +86,7 @@ def setup_comm(config: PipelineConfig) -> Node | None:
     Returns:
         The node if world_size > 1, otherwise None
     """
-    if not config.pipeline_enabled:
+    if not config.is_enabled:
         return None
 
     # Setup node (with or without seed)
@@ -113,7 +125,7 @@ def patch_model_load(config: PipelineConfig) -> None:
     from vllm.model_executor.models.utils import LayerFn, PPMissingLayer, maybe_offload_to_cpu
 
     # Skip patching if world_size == 1
-    if not config.pipeline_enabled:
+    if not config.is_enabled:
         return
 
     def _patched_make_layers(num_hidden_layers: int, layer_fn: LayerFn, prefix: str) -> Tuple[int, int, torch.nn.ModuleList]:
@@ -149,28 +161,96 @@ def patch_model_load(config: PipelineConfig) -> None:
 
 
 def setup_hooks(
-    config: PipelineConfig,
     llm: LLM,
+    config: PipelineConfig,
     node: Node | None,
     start_layer_key: str = "model.start_layer",
     end_layer_key: str = "model.end_layer",
     model_layers_key: str = "model.layers",
 ) -> None:
     """
-    Setup hooks to enable pipeline parallel inference.
+    Sets up hooks to enable pipeline parallel inference. Directly sets up the
+    main hooks on the driver worker (current process) to receive and relay
+    intermediate states and outputs. For non-driver workers, we setup a hook
+    with a blocking receive to receive intermediate states from the driver worker.
+    This is only needed when TP and PP are enabled.
+
+    NB:
+    - We assume that the vLLM model class (i.e. the nn.Module implmenting the
+    forward pass) has an attribute `start_layer` and `end_layer` that indicates
+    index of first and last layer (+1) of the current model shard. It can be
+    accessed by the `start_layer_key` and `end_layer_key` arguments.
+    - We assume that the vLLM model class has an attribute `layers` that is a
+    list of layers. It can be accessed via the `model_layers_key` argument.
 
     Args:
+        llm: The vLLM instance
         config: The pipeline configuration
-        llm: The LLM model shard instance
         node: The node class instances for communication (None if world_size == 1)
+        start_layer_key: The key to the start layer in the model (e.g. "model.start_layer")
+        end_layer_key: The key to the end layer in the model (e.g. "model.end_layer")
+        model_layers_key: The key to the layers in the model (e.g. "model.layers")
     """
-    if not config.pipeline_enabled:
+    # Setup driver hooks
+    driver_worker = llm.llm_engine.model_executor.driver_worker
+    setup_hooks_driver(driver_worker, config, node, start_layer_key, end_layer_key, model_layers_key)
+
+    # Setup non-driver hooks
+    model_executor = llm.llm_engine.model_executor
+
+    if isinstance(model_executor, MultiprocessingDistributedExecutor):
+        model_executor.collective_rpc(
+            lambda worker: setup_hooks_non_driver(worker, config, start_layer_key, model_layers_key),
+            kwargs=dict(async_run_tensor_parallel_workers_only=True),
+        )
+
+
+def setup_hooks_driver(
+    worker,
+    config: PipelineConfig,
+    node: Node | None,
+    start_layer_key: str,
+    end_layer_key: str,
+    model_layers_key: str,
+) -> None:
+    """
+    Setup hooks on the driver worker (current process) for pipeline parallel
+    communication. Installs different hooks depending on the stage of the pipeline:
+
+    1. First stage:
+    - Receive sample outputs from last stage
+    - Send intermediate states to next stage
+
+    2. Last stage:
+    - Receive intermediate states from previous stage
+    - Broadcast intermediate states within TP group
+    - Send sample outputs to first stage
+
+    3. Intermediate stages:
+    - Receive intermediate states from previous stage
+    - Broadcast intermediate states within TP group
+    - Send intermediate states to next stage
+    - Receive and relay sample outputs to the next stage (unless next stage is the last stage)
+
+    Note that the order in which the hooks of the same type are registered is
+    important. For example, the non-first stages need to first receive the
+    intermediate states before broadcasting them within the TP group.
+
+    Args:
+        worker: The worker object (passed by collective_rpc)
+        config: The pipeline configuration
+        node: The node class instances for communication (None if world_size == 1)
+        start_layer_key: The key to the start layer in the model (e.g. "model.start_layer")
+        end_layer_key: The key to the end layer in the model (e.g. "model.end_layer")
+        model_layers_key: The key to the layers in the model (e.g. "model.layers")
+    """
+    if not config.is_enabled:
         assert node is None, "Node should be None if pipeline is disabled"
         return
 
     # Model runner owns sampler, model owns layers
-    model_runner: nn.Module = llm.llm_engine.model_executor.driver_worker.model_runner
-    model: nn.Module = model_runner.model
+    model_runner = worker.model_runner
+    model = worker.get_model()
 
     # Extract first and last layers (pre/post-hook to recv/send intermediate states)
     first_layer_idx = rgetattr(model, start_layer_key)
@@ -184,7 +264,7 @@ def setup_hooks(
     # Don't relay outputs from stage with index -2->-1
     relay = config.rank != config.world_size - 2
 
-    if config.rank == 0:  # First stage
+    if config.is_first_stage:  # First stage
         # Send intermediate states to next stage (post-hook)
         last_layer.register_forward_hook(partial(send_intermediate_states, node=node))
         logger.debug("Registered post-hook send_intermediate_states on last layer")
@@ -192,10 +272,14 @@ def setup_hooks(
         # Receive outputs from last stage (post-hook)
         sampler.register_forward_hook(partial(recv_output, node=node, relay=relay))
         logger.debug("Registered post-hook recv_output on sampler")
-    elif config.rank == config.world_size - 1:  # Last stage
+    elif config.is_last_stage:  # Last stage
         # Receive intermediate states from previous stage (pre-hook)
         first_layer.register_forward_pre_hook(partial(recv_intermediate_states, node=node))
         logger.debug("Registered pre-hook recv_intermediate_states on first layer")
+
+        # Broadcast intermediate states within TP group (pre-hook)
+        first_layer.register_forward_pre_hook(broadcast_intermediate_states)
+        logger.debug("Registered pre-hook broadcast_intermediate_states on first layer")
 
         # Send outputs to first  stage (post-hook)
         sampler.register_forward_hook(partial(send_output, node=node))
@@ -204,6 +288,10 @@ def setup_hooks(
         # Receive intermediate states from previous stage and send positions to next stage (pre-hook)
         first_layer.register_forward_pre_hook(partial(recv_intermediate_states, node=node))
         logger.debug("Registered pre-hook recv_intermediate_states on first layer")
+
+        # Broadcast intermediate states within TP group (pre-hook)
+        first_layer.register_forward_pre_hook(broadcast_intermediate_states)
+        logger.debug("Registered pre-hook broadcast_intermediate_states on first layer")
 
         # Send intermediate states to next stage (post-hook)
         last_layer.register_forward_hook(partial(send_intermediate_states, node=node))
@@ -214,9 +302,70 @@ def setup_hooks(
         logger.debug("Registered post-hook recv_output on sampler")
 
 
+def setup_hooks_non_driver(
+    worker,
+    config: PipelineConfig,
+    start_layer_key: str,
+    model_layers_key: str,
+) -> None:
+    """
+    Setup hooks on non-driver worker via remote RPC call (called by vLLM model
+    executor). For all but the first stage, we need to receive the intermediate
+    states from the previous stage by listening to a broadcast from the driver
+    worker. This is only required when TP and PP are enabled.
+
+    Note that all arguments to this function must be pickleable.
+
+    Args:
+        worker: The worker object (passed by collective_rpc)
+        config: The pipeline configuration
+        node: The node class instances for communication (None if world_size == 1)
+        start_layer_key: The key to the start layer in the model (e.g. "model.start_layer")
+        end_layer_key: The key to the end layer in the model (e.g. "model.end_layer")
+        model_layers_key: The key to the layers in the model (e.g. "model.layers")
+    """
+    if not config.is_enabled:
+        return
+
+    # Model owns layers
+    model = worker.get_model()
+
+    # Extract first and last layers (pre/post-hook to recv/send intermediate states)
+    first_layer_idx = rgetattr(model, start_layer_key)
+    first_layer: nn.Module = rgetattr(model, model_layers_key)[first_layer_idx]
+
+    if not config.is_first_stage:  # Not first stage
+        # Receive intermediate states from TP driver worker (pre-hook)
+        first_layer.register_forward_pre_hook(broadcast_intermediate_states)
+        logger.debug("Registered pre-hook broadcast_intermediate_states on first layer")
+
+
+def broadcast_intermediate_states(_, input: Tuple) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    A pre-hook that broadcasts the hidden states and residual from TP rank 0 to
+    all other ranks. Note that if the TP size is 1, this is a no-op.
+
+    Args:
+        _: The module that is being hooked
+        input: The input to the module (here the positions, hidden states and residual of a decoder layer)
+
+    Returns:
+        The modified input tuple (positions, hidden_states, residual)
+    """
+    positions, hidden_states, residual = input
+    if residual is None:
+        residual = torch.zeros_like(hidden_states, device=hidden_states.device, dtype=hidden_states.dtype)
+    get_tp_group().broadcast(hidden_states)
+    get_tp_group().broadcast(residual)
+    # logger.debug("Broadcasted hidden_states and residual")
+
+    return positions, hidden_states, residual
+
+
 def send_intermediate_states(_, __, output: Tuple, node: Node) -> None:
     """
-    A post-hook that sends the hidden states and residual of the last decoder layer to the next stage node's first layer.
+    A post-hook that sends the hidden states and residual of the last decoder
+    layer to the next stage.
 
     Args:
         _: The module that is being hooked
@@ -230,16 +379,18 @@ def send_intermediate_states(_, __, output: Tuple, node: Node) -> None:
     # logger.debug(f"Sent hidden_states and residual ({hidden_states.shape}, {residual.shape}) ({len(serialized_tensors)} bytes)")
 
 
-def recv_intermediate_states(_, input: Tuple, node: Node) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def recv_intermediate_states(_, input: Tuple, node: Node) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    A pre-hook that receives the hidden states and residual from the previous stage node's last layer at the first layer of the current node.
-
-    Assumes the node is correctly set up to receive hidden states and residual from the previous node.
+    A pre-hook that receives the hidden states and residual from the previous
+    stage at the first layer of the current node.
 
     Args:
         _: The module that is being hooked
         input: The input to the module (here the positions, hidden states and residual of the previous node's last layer)
         node: The node class instances for communication
+
+    Returns:
+        The modified input tuple (positions, hidden_states, residual)
     """
     positions, _, _ = input
     device = positions.device
@@ -247,22 +398,24 @@ def recv_intermediate_states(_, input: Tuple, node: Node) -> Tuple[torch.Tensor,
     deserialized_tensors = deserialize_tensors(serialized_tensors, device)
     hidden_states = deserialized_tensors["hidden_states"]
     residuals = deserialized_tensors["residual"]
-    # logger.debug(f"Got hidden_states and residuals ({hidden_states.shape}, {residuals.shape}) ({len(serialized_tensors)} bytes)")
+    # logger.debug(f"Received hidden_states and residuals ({hidden_states.shape}, {residuals.shape}) ({len(serialized_tensors)} bytes)")
 
     return positions, hidden_states, residuals
 
 
 def recv_output(_, __, output, node: Node, relay=False) -> SamplerOutput:
     """
-    A post-hook that receives sampling outputs from the last stage node and optionally relays them to the next stage node.
-    For a pipeline with 4 stages, this hook should be registered as follows:
+    A post-hook that receives sampling outputs from the last stage node and
+    optionally relays them to the next stage node.  For a pipeline with 4
+    stages, this hook should be registered as follows:
 
     Rank 1: Receive output + relay
     Rank 2: Receive output + relay
     Rank 3: Receive output
     Rank 4: *Do not register hook* (use the `send_output` hook)
 
-    Receiving and relaying the outputs is necessary for the schedulers to be synchronized across stages.
+    Receiving and relaying the outputs is necessary for the schedulers to be
+    synchronized across stages.
 
     Args:
         _: The module that is being hooked
@@ -270,6 +423,9 @@ def recv_output(_, __, output, node: Node, relay=False) -> SamplerOutput:
         ____: The outputs of the module
         node: The node class instances for communication
         relay: Whether to relay the outputs to the next stage node
+
+    Returns:
+        The sampling outputs
     """
     serialized_output = node.irecv(tag=0).wait()
     # logger.debug(f"Received outputs ({len(serialized_output)} bytes)")
@@ -282,13 +438,17 @@ def recv_output(_, __, output, node: Node, relay=False) -> SamplerOutput:
 
 def send_output(_, __, output: SamplerOutput, node: Node) -> None:
     """
-    A post-hook that sends the sampling outputs from the last stage node to the first stage node.
+    A post-hook that sends the sampling outputs from the last stage node to the
+    first stage node.
 
     Args:
         _: The module that is being hooked
         __: The arguments to the module
         output: The outputs of the module
         node: The node class instances for communication
+
+    Returns:
+        None
     """
     serialized_output = serialize_sampler_output(output)
     node.isend(serialized_output, tag=0, latency=None).wait()
@@ -309,8 +469,7 @@ def all_reduce(node: Node, tensor: torch.Tensor, config: PipelineConfig, op: cal
         The reduced tensor after applying the operation across all nodes in the ring
     """
     # No communication needed for single node
-    if not config.pipeline_enabled:
-        logger.debug("No communication needed to all-reduce tensor with pipeline disabled")
+    if not config.is_enabled:
         return tensor
 
     result_tensor = tensor.clone()

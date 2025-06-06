@@ -16,6 +16,7 @@ class SamplingParamConfig(BaseConfig):
     n: int = 8
     logprobs: int = 0  # 0 mean 1 logprob here
     top_k: int = -1
+    seed: int | None = None
 
 
 class DifficultyFilteringConfig(BaseConfig):
@@ -26,12 +27,10 @@ class DifficultyFilteringConfig(BaseConfig):
 
 class Config(BaseConfig):
     model_name: str
-    dataset: str
+    dataset: str = "PrimeIntellect/INTELLECT-2-RL-Dataset"
 
     # The maximum number of of sequences to decode in parallel (if None, will be computed automatically)
     batch_size: int | Literal["auto"] = "auto"
-
-    max_samples: int | None = None
 
     # The step to start from (if None, will start from 0)
     start_step: int | None = None

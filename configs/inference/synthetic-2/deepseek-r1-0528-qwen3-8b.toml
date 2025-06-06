@@ -1,0 +1,17 @@
+model_name = "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B"
+
+max_model_len = 16384
+tp = "auto"
+output_path = "/data"
+toploc = true
+
+[monitor.socket]
+enable = true
+
+[pp]
+connection_num_retries = 100
+
+[sampling]
+n = 8
+temperature = 0.6
+top_p = 0.95

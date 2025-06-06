@@ -68,13 +68,14 @@ def test_output_directories_exist(output_path: Path):
     # Ensure processes have completed before checking output
     assert output_path.joinpath("step_0").exists()
     assert output_path.joinpath("step_1").exists()
-    assert not output_path.joinpath("step_2").exists()
+    assert output_path.joinpath("step_2").exists()
+    assert not output_path.joinpath("step_3").exists()
 
 
 def test_output_files_have_correct_schemas(output_path: Path):
     # Ensure processes have completed before checking output
     files = list(output_path.rglob("*.parquet"))
-    assert len(files) == 4, f"Expected 4 files, got {len(files)}"
+    assert len(files) == 6, f"Expected 6 files, got {len(files)}"
     for file in files:
         assert pq.read_schema(file).equals(pa_schema)
 
