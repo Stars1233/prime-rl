@@ -1,7 +1,8 @@
-model_name= "Qwen/QwQ-32B"
 project = "intellect-2"
-
 collate_mode = "packing"
+
+[model]
+name = "Qwen/QwQ-32B"
 
 [train]
 micro_bs = 1
@@ -14,8 +15,6 @@ ignore_zero_advantages = true
 
 [optim]
 batch_size = 512
-warmup_steps = 25
-total_steps = 10000000000000000000
 step_per_rollout = 8
 grad_norm_clip = 0.1
 
