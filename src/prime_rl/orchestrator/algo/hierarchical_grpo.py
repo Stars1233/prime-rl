@@ -29,10 +29,10 @@ class HierarchicalGRPOAlgorithm(Algorithm):
         self.episode_agents = set(config.episode_agents)
 
     async def score_group(self, group: list[Rollout]) -> None:
-        peers: dict[tuple[str | None, str | None], list[Rollout]] = defaultdict(list)
+        peers: dict[tuple[str, str | None], list[Rollout]] = defaultdict(list)
         for rollout in group:
-            episode_scoped = rollout.agent_name in self.episode_agents
-            key = (rollout.agent_name, rollout.episode_id if episode_scoped else None)
+            episode_scoped = rollout.agent.name in self.episode_agents
+            key = (rollout.agent.name, rollout.episode_id if episode_scoped else None)
             peers[key].append(rollout)
         for members in peers.values():
             baseline = sum(rollout.reward for rollout in members) / len(members)
