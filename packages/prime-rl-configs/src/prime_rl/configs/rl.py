@@ -222,7 +222,7 @@ class RLConfig(BaseConfig):
     orchestrator: OrchestratorConfig
 
     inference: InferenceConfig | None = None
-    """Inference server configuration. If None, the rl entrypoint will not start an inference server (useful for elastic inference pools or manually started servers)."""
+    """Inference server configuration. If None, the rl entrypoint will not start an inference server (useful for manually started servers)."""
 
     env_vars: EnvVars = {}
     """Extra environment variables for every launched RL component. Component-specific env_vars override these."""
@@ -603,6 +603,7 @@ class RLConfig(BaseConfig):
 
     @model_validator(mode="after")
     def auto_setup_deployment(self):
+        self.orchestrator.pad_to_multiple_of = self.trainer.model.cp
         if self.deployment.type == "single_node":  # single-node
             # set num_train_workers to the number of data replicas
             non_data_parallel_size = self.trainer.model.cp
@@ -625,7 +626,9 @@ class RLConfig(BaseConfig):
                     self.inference.vllm.api_server_count = dp
 
         elif self.deployment.type == "multi_node":  # multi-node
-            self.orchestrator.num_train_workers = self.deployment.num_train_nodes * self.deployment.gpus_per_node
+            self.orchestrator.num_train_workers = (
+                self.deployment.num_train_nodes * self.deployment.gpus_per_node // self.trainer.model.cp
+            )
 
             if self.deployment.nodes_per_fsdp_group is not None:
                 if self.deployment.num_train_nodes % self.deployment.nodes_per_fsdp_group != 0:
@@ -756,7 +759,7 @@ class RLConfig(BaseConfig):
         if not self.orchestrator.any_policy_sourced and "base_url" not in client.model_fields_set:
             host = self.inference.server.host or "localhost"
             port = self.inference.server.port
-            client.base_url = [f"http://{host}:{port}/v1"]
+            client.base_url = f"http://{host}:{port}/v1"
         if (
             self.deployment.type == "single_node"
             and self.inference.router is not None
