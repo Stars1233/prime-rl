@@ -18,6 +18,8 @@ METRIC_PREFIX = "vllm:"
 PD_ROLES = {"prefill", "decode"}
 QUANTILES = {"p50": 0.5, "p90": 0.9, "p99": 0.99}
 AGGREGATIONS = {"min": min, "max": max, "sum": sum, "mean": mean, "median": median}
+OVERLOAD_WAITING_FRACTION = 0.2
+OVERLOAD_WARN_INTERVAL = 60.0
 
 # Scope-level ratios derived from counter deltas; each operand lists legacy and
 # OpenMetrics sample names, whichever the running vLLM version emits.
@@ -262,11 +264,18 @@ class InferenceMetricsCollector:
     names.
     """
 
-    def __init__(self, admin_clients: list[AsyncClient], roles: list[str | None] | None = None):
+    def __init__(
+        self,
+        admin_clients: list[AsyncClient],
+        roles: list[str | None] | None = None,
+        max_inflight_episodes: int | None = None,
+    ):
         self.endpoints = build_metrics_endpoints(admin_clients, roles=roles)
         self.previous: dict[tuple[str, str], TimedSnapshot] = {}
         self.task: asyncio.Task | None = None
         self.has_pd_roles = {endpoint.role for endpoint in self.endpoints if endpoint.role is not None} == PD_ROLES
+        self.max_inflight_episodes = max_inflight_episodes
+        self.last_overload_warning = float("-inf")
         get_logger().info(
             "Collecting inference metrics from "
             + ", ".join(f"{endpoint.name}={endpoint.key}" for endpoint in self.endpoints)
@@ -310,6 +319,20 @@ class InferenceMetricsCollector:
         metrics = self.build_metrics(samples)
         for sample in samples:
             self.previous[sample.key] = TimedSnapshot(timestamp=sample.timestamp, snapshot=sample.snapshot)
+
+        waiting_requests = metrics.get("inference/agg/num_requests_waiting/sum", 0.0)
+        if (
+            self.max_inflight_episodes is not None
+            and waiting_requests > OVERLOAD_WAITING_FRACTION * self.max_inflight_episodes
+            and now - self.last_overload_warning >= OVERLOAD_WARN_INTERVAL
+        ):
+            self.last_overload_warning = now
+            get_logger().warning(
+                f"Inference is overloaded: {waiting_requests:.0f} waiting request(s), more than "
+                f"{OVERLOAD_WAITING_FRACTION:.0%} of max_inflight_episodes={self.max_inflight_episodes} - "
+                "training is slowed by queued requests. If intermittent, wait it out - if persistent, "
+                "lower concurrency by decreasing max_inflight_episodes"
+            )
 
         if metrics:
             metrics["_timestamp"] = time.time()
