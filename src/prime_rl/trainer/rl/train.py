@@ -124,17 +124,21 @@ def train(config: TrainerConfig):
     # Check for checkpoint to resume from
     checkpoint_step = None
     logger.info(f"Initializing checkpoint managers ({config.ckpt})")
-    ckpt_manager, weight_ckpt_manager = setup_ckpt_managers(config.output_dir, config.ckpt, config.model.lora)
+    ckpt_manager, weight_ckpt_manager = setup_ckpt_managers(
+        config.output_dir, config.ckpt, config.model.lora, resume=config.resume
+    )
 
-    if config.ckpt and config.ckpt.resume_step is not None and ckpt_manager is not None:
-        if config.ckpt.resume_step == -1:
-            checkpoint_step = resolve_latest_ckpt_step(ckpt_manager.ckpt_dir)
+    if config.resume is not None:
+        if config.resume.dir is not None:
+            checkpoint_step = config.resume.dir_step
         else:
-            checkpoint_step = config.ckpt.resume_step
+            checkpoint_step = config.resume.step
+            if checkpoint_step is None:
+                checkpoint_step = resolve_latest_ckpt_step(ckpt_manager.ckpt_dir)
 
     # Initialize the model and tokenizer
     logger.info(f"Initializing model ({config.model})")
-    loading_from_ckpt_later = config.ckpt and checkpoint_step is not None
+    loading_from_ckpt_later = checkpoint_step is not None
     model = setup_model(config.model, parallel_dims, loading_from_ckpt_later)
 
     logger.info(f"Initializing tokenizer ({config.tokenizer})")
@@ -209,7 +213,15 @@ def train(config: TrainerConfig):
     # Optionally, resume training from a checkpoint
     progress = Progress()
     if checkpoint_step is not None:
-        ckpt_manager.load(checkpoint_step, model, [optimizer], scheduler, progress)
+        resume_dir = config.resume.dir if config.resume else None
+        ckpt_manager.load(
+            checkpoint_step,
+            model,
+            [optimizer],
+            scheduler,
+            progress,
+            path=resume_dir / "trainer" if resume_dir is not None else None,
+        )
         # The checkpoint finished step ``checkpoint_step``; resume training at the next step.
         progress.step += 1
         logger.info(f"Resuming training from checkpoint step {checkpoint_step}")
@@ -577,8 +589,7 @@ def train(config: TrainerConfig):
 
         # Checkpoint the step we just finished (model = policy v{progress.step}).
         if (
-            ckpt_manager is not None
-            and (config.ckpt and config.ckpt.interval)
+            (config.ckpt and config.ckpt.interval)
             # the last step is written once after the loop (final ckpt), so skip it here
             and not is_last_step
             and progress.step % config.ckpt.interval == 0
@@ -712,8 +723,8 @@ def train(config: TrainerConfig):
     token_exporter.close()
 
     # Write final checkpoint
-    if ckpt_manager is not None:
-        if not (config.ckpt and config.ckpt.weights_only):
+    if config.ckpt is not None:
+        if not config.ckpt.weights_only:
             logger.info("Writing final checkpoint")
             ckpt_manager.save(progress.step, model, [optimizer], scheduler, progress)
         ckpt_manager.maybe_clean()

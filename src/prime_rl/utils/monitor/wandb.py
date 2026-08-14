@@ -79,7 +79,8 @@ class WandbMonitor(Monitor):
         _wandb_mode = os.environ.get("WANDB_MODE")
         shared_mode = os.environ.get("WANDB_SHARED_MODE") == "1" and _wandb_mode not in ("disabled", "offline")
         if shared_mode:
-            run_id = os.environ.get("WANDB_SHARED_RUN_ID")
+            # W&B's native run-id var, set by the launcher to $PRL_RUN_ID.
+            run_id = os.environ.get("WANDB_RUN_ID")
             label = os.environ.get("WANDB_SHARED_LABEL")
             primary = label == "orchestrator"
             settings = wandb.Settings(
