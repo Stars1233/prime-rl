@@ -39,8 +39,8 @@ if TYPE_CHECKING:
     from prime_rl.orchestrator.ckpt import CheckpointManager
     from prime_rl.transport.base import MicroBatchSender
     from prime_rl.utils.client import InferencePool
-    from prime_rl.utils.monitor.base import Monitor
 import prime_rl._compat  # noqa: F401 — patch ring_flash_attn compat before transitive imports
+from prime_rl import monitors
 from prime_rl.configs.orchestrator import OrchestratorConfig
 from prime_rl.orchestrator.ckpt import setup_ckpt_manager
 from prime_rl.orchestrator.dispatcher import DispatcherMetrics, DispatcherMode, RolloutDispatcher
@@ -66,8 +66,8 @@ from prime_rl.orchestrator.types import (
 )
 from prime_rl.orchestrator.utils import (
     get_weight_dir,
+    group_episodes,
     intercept_vf_logging,
-    save_rollouts,
     set_default_executor,
     setup_policy_inference_pool,
     trim_process_memory,
@@ -80,9 +80,6 @@ from prime_rl.utils.async_utils import EventLoopLagMonitor, EventLoopLagStats, s
 from prime_rl.utils.client import init_nccl_broadcast, init_nixl_broadcast
 from prime_rl.utils.heartbeat import Heartbeat
 from prime_rl.utils.logger import format_time, get_logger, setup_logger
-from prime_rl.utils.monitor import setup_monitor
-from prime_rl.utils.pathing import get_trace_path
-from prime_rl.utils.usage_reporter import UsageReporter
 from prime_rl.utils.utils import (
     clean_exit,
     resolve_latest_ckpt_step,
@@ -128,7 +125,6 @@ class Orchestrator:
     # Always set by ``setup()``
     tokenizer: PreTrainedTokenizer
     policy_inference: InferencePool
-    monitor: Monitor
     sender: MicroBatchSender | None
     packer: BatchPacker
     train_envs: TrainEnvs
@@ -143,7 +139,6 @@ class Orchestrator:
     renderer: Renderer | None
     mm_token_type_ids_mapping: dict[int, int] | None
     heart: Heartbeat | None
-    usage_reporter: UsageReporter | None
     inference_metrics: InferenceMetricsCollector | None
     eval_envs: EvalEnvs | None
     eval_sink: EvalSink | None
@@ -185,7 +180,6 @@ class Orchestrator:
         self.renderer = None
         self.mm_token_type_ids_mapping = None
         self.heart = None
-        self.usage_reporter = None
         self.inference_metrics = None
         self.eval_envs = None
         self.eval_sink = None
@@ -221,20 +215,18 @@ class Orchestrator:
         if self.mm_token_type_ids_mapping == {}:
             self.mm_token_type_ids_mapping = None
 
-        get_logger().info(f"Initializing monitor (wandb={config.wandb}, prime_monitor={config.prime_monitor})")
-        self.monitor = setup_monitor(
-            wandb_config=config.wandb,
-            prime_config=config.prime_monitor,
-            file_config=config.file_monitor,
+        get_logger().info(f"Initializing monitors ({config.monitors})")
+        await monitors.setup(
+            wandb=config.monitors.wandb,
+            prime=config.monitors.prime,
+            file=config.monitors.file,
             output_dir=config.output_dir,
-            tokenizer=self.tokenizer,
             run_config=config,
             train_env_names=[env.resolved_name for env in config.train.source],
             eval_env_names=[source.resolved_name for source in config.eval.source] if config.eval is not None else [],
         )
-        # Prefer the monitor identity (platform run id, else W&B id) so traces link
-        # back to it, then the launcher-set $PRL_RUN_ID; standalone runs mint a local one.
-        self.run_id = self.monitor.run_id or os.environ.get("PRL_RUN_ID") or uuid.uuid4().hex
+        # The launcher-set $PRL_RUN_ID is the run identity; standalone runs mint a local one.
+        self.run_id = os.environ.get("PRL_RUN_ID") or uuid.uuid4().hex
         # Base labels for sandboxes created in this process; env-server processes read
         # the same launcher-set env var themselves.
         self.run_name = os.environ.get("PRL_RUN_NAME")
@@ -243,11 +235,6 @@ class Orchestrator:
 
         if config.heartbeat is not None:
             self.heart = Heartbeat(config.heartbeat.url)
-
-        usage_base_url = os.environ.get("PI_USAGE_BASE_URL")
-        usage_api_key = os.environ.get("PI_USAGE_API_KEY")
-        if usage_base_url and usage_api_key:
-            self.usage_reporter = UsageReporter()
 
         # Filters apply to train rollouts only
         pre_filters = setup_filters(config.pre_batch_filters, vocab_size=self.tokenizer.vocab_size, kind="pre-batch")
@@ -294,7 +281,9 @@ class Orchestrator:
             *(env.algorithm.setup() for env in self.train_envs),
         )
 
-        if config.wandb is not None and config.collect_inference_metrics:
+        # Gate on the registered monitor, not the config - the collector logs to the global
+        # W&B session, which only exists when the monitor's init succeeded.
+        if monitors.get(monitors.WandbMonitor) is not None and config.collect_inference_metrics:
             self.inference_metrics = InferenceMetricsCollector(
                 self.policy_inference.admin_clients,
                 roles=config.inference_metrics_roles,
@@ -399,7 +388,7 @@ class Orchestrator:
 
         assert config.max_inflight_episodes is not None, "max_inflight_episodes must be resolved before dispatcher init"
         log_interval = config.log.interval
-        wandb_enabled = config.wandb is not None
+        wandb_enabled = monitors.get(monitors.WandbMonitor) is not None
         self.dispatcher = RolloutDispatcher(
             train_envs=self.train_envs,
             eval_envs=self.eval_envs,
@@ -497,9 +486,11 @@ class Orchestrator:
             elapsed = format_time(time.perf_counter() - start_time)
             if clean_exit:
                 get_logger().success(f"Orchestrator step loop done in {elapsed}")
+                # Finalize only on a clean exit — a crashed run must not be marked
+                # completed; the platform run's atexit hook marks it failed instead.
+                await monitors.finalize()
             else:
                 get_logger().warning(f"Orchestrator interrupted after {elapsed} — forcing cleanup (not a clean exit)")
-            self.monitor.save_final_summary()
             # ``progress.step`` points at the next (unshipped) step; the last finished step is
             # ``progress.step - 1``. Checkpoint it as ``step_{progress.step - 1}`` (no-op before the
             # first ship).
@@ -549,11 +540,7 @@ class Orchestrator:
                     episode_id=rollout.episode_id,
                     policy_version=rollout.policy_version,
                 )
-            await asyncio.to_thread(
-                save_rollouts,
-                [rollout.to_record() for rollout in episode],
-                get_trace_path(self.config.output_dir, step, kind, "all"),
-            )
+            await monitors.log(group_episodes(episode), step, kind, "all")
 
             if kind == "eval":
                 assert self.eval_sink is not None  # eval rollouts only emitted when eval is configured
@@ -570,7 +557,7 @@ class Orchestrator:
 
     async def finalize_train_batch(self, batch: TrainBatch) -> None:
         """Ship one ``TrainBatch`` out to the trainer and handle the I/O
-        side-effects (ckpt, save_rollouts, reference scoring, sender.send,
+        side-effects (ckpt, monitors.log, reference scoring, sender.send,
         metrics, heartbeat, progress, eval trigger). The sink has already
         done all data-transformation work."""
         config = self.config
@@ -644,12 +631,9 @@ class Orchestrator:
             if self.train_envs.get(r.env_name).sampler.samples_from_live_policy:
                 r.off_policy_steps = (step - 1) - r.policy_version
 
-        # The effective (clean, trained-on) subset lands in the per-step ``effective`` trace file
-        # at ship time; the full arrival window already streamed into ``all`` on arrival.
-        # to_record drops the per-node training tensors — they're for training, not the rollout
-        # record, and can't round-trip json (raw numpy bytes).
-        records = [r.to_record() for r in effective]
-        await asyncio.to_thread(save_rollouts, records, get_trace_path(config.output_dir, step, "train", "effective"))
+        # The effective (clean, trained-on) subset is logged at ship time; the full arrival
+        # window already streamed into the ``all`` cohort on arrival.
+        await monitors.log(group_episodes(effective.rollouts), step, "train", "effective")
 
         pack_start_time = time.perf_counter()
         micro_batch_grid = await asyncio.to_thread(self.packer.pack, batch.samples)
@@ -701,25 +685,9 @@ class Orchestrator:
             )
             for name, count in self.train_sink.pre_filter_dropped_by_name.items():
                 metrics[f"pre_filters/all/{name}/rate"] = count / self.train_sink.pre_filter_seen
-        self.monitor.log(metrics, step=step)
+        await monitors.log(metrics, step=step)
         self.wait_for_policy_time = 0.0
-        self.monitor.log_samples(effective.rollouts, step=step)
-        self.monitor.log_distributions(
-            distributions={
-                "rewards": [r.reward for r in effective],
-                "advantages": [a for r in effective if (a := r.scalar_advantage()) is not None],
-            },
-            step=step,
-        )
 
-        if self.usage_reporter is not None:
-            run_id = os.getenv("RUN_ID", "")
-            if run_id:
-                self.usage_reporter.report_training_usage(
-                    run_id=run_id,
-                    step=step,
-                    tokens=num_input + num_output,
-                )
         if self.heart is not None:
             self.heart.beat()
 
@@ -857,21 +825,15 @@ class Orchestrator:
         get_logger().success("\n\t\t ".join(lines))
 
     async def finalize_eval_batch(self, batch: EvalBatch) -> None:
-        """Persist + log one completed eval epoch (save_rollouts,
-        monitor.log_eval_samples, monitor.log)."""
+        """Persist + log one completed eval epoch through the monitors."""
         if not batch.rollouts:
             get_logger().warning(f"Eval @ step={batch.step} env={batch.env_name}: no rollouts returned, skipping log")
             return
 
-        # The non-errored subset lands in the per-step ``effective`` trace file on epoch
-        # completion (multiple eval envs share the step file — each epoch appends its cohort
-        # once, and every record carries ``env_name``); the full returned cohort already
-        # streamed into ``all`` on arrival.
-        records = [r.to_record() for r in batch.rollouts.effective]
-        await asyncio.to_thread(
-            save_rollouts, records, get_trace_path(self.config.output_dir, batch.step, "eval", "effective")
-        )
-        self.monitor.log_eval_samples(batch.rollouts, env_name=batch.env_name, step=batch.step)
+        # The non-errored subset is logged on epoch completion (multiple eval envs share the
+        # step's trace file — each epoch appends its cohort once, and every record carries
+        # ``env_name``); the full returned cohort already streamed into ``all`` on arrival.
+        await monitors.log(group_episodes(batch.rollouts.effective.rollouts), batch.step, "eval", "effective")
         policy_versions = {r.policy_version for r in batch.rollouts}
         policy_version = min(policy_versions)
         if len(policy_versions) > 1:
@@ -887,7 +849,7 @@ class Orchestrator:
             metrics |= pool.metrics.to_wandb(prefix=f"eval/{batch.env_name}", subset=subset)
         metrics[f"eval/{batch.env_name}/policy_version"] = float(policy_version)
         metrics["step"] = float(batch.step)
-        self.monitor.log(metrics, step=batch.step)
+        await monitors.log(metrics, step=batch.step)
 
         # Success line — quality metrics over the effective set, error rate over the full returned
         # cohort. ``Stat.mean()`` is 0.0 for an empty set.
@@ -992,8 +954,6 @@ class Orchestrator:
                 for env in self.train_envs:
                     for pool in (*env.sampler.connected_pools, *env.algorithm.connected_pools):
                         await pool.stop()
-            if self.usage_reporter is not None:
-                self.usage_reporter.close()
 
         task = asyncio.create_task(teardown())
         _, pending = await asyncio.wait({task}, timeout=SHUTDOWN_TIMEOUT_S)
