@@ -29,8 +29,6 @@ import time
 import uuid
 from subprocess import Popen
 
-import verifiers.v1 as vf
-
 from prime_rl import monitors
 from prime_rl.configs.evals import EvalsConfig
 from prime_rl.orchestrator.concurrency import ConcurrencyController
@@ -44,8 +42,8 @@ from prime_rl.orchestrator.patches import (
     monkey_patch_oai_iterable_types,
 )
 from prime_rl.orchestrator.periodic_logger import PeriodicLogger
-from prime_rl.orchestrator.types import EvalBatch, Policy, Rollout
-from prime_rl.orchestrator.utils import group_episodes, intercept_vf_logging, set_default_executor
+from prime_rl.orchestrator.types import EvalBatch, Policy
+from prime_rl.orchestrator.utils import eval_work, intercept_vf_logging, set_default_executor
 from prime_rl.utils.client import InferencePool
 from prime_rl.utils.config import dump_resolved_config
 from prime_rl.utils.logger import format_time, get_logger, setup_logger
@@ -122,10 +120,13 @@ class Evals:
             eval_source=self.eval_source,
             policy_pool=self.pool,
             policy=self.policy,
+            progress=None,
             initial_max_inflight=self.concurrency.max_inflight,
             max_inflight_ceiling=config.eval.concurrency.max_inflight,
             tasks_per_minute=None,
             max_off_policy_steps=0,
+            run_id=self.run_id,
+            run_name=self.run_name,
             on_episode_complete=self.concurrency.record_episode,
         )
         # No ``on_overload``: eval episodes are measurements and are never
@@ -336,19 +337,9 @@ class Evals:
         # An env with no examples emits no episodes, so its epoch can never finalize.
         pending = {env_name for env_name in fired if self.eval_sink.batch_size_for(env_name) > 0}
         while pending:
-            episode: list[Rollout] = await self.dispatcher.out_q.get()
-            step = episode[0].eval_step
-            assert step is not None
-            run = vf.EvalRunInfo(id=self.run_id, name=self.run_name, step=step)
-            for rollout in episode:
-                rollout.record_run(
-                    run,
-                    env_name=rollout.env_name,
-                    group_id=str(rollout.group_id),
-                    episode_id=rollout.episode_id,
-                    policy_version=rollout.policy_version,
-                )
-            await monitors.log(group_episodes(episode), step, "eval", "all")
+            episode = await self.dispatcher.out_q.get()
+            step = eval_work(episode).step
+            await monitors.log([episode], step, "eval", "all")
             eval_batch = self.eval_sink.add(episode)
             if eval_batch is not None:
                 await self.finalize_eval_batch(eval_batch)
@@ -357,22 +348,22 @@ class Evals:
     async def finalize_eval_batch(self, batch: EvalBatch) -> None:
         """Persist + log one completed eval epoch through the monitors, mirroring the
         orchestrator: effective episodes plus the ``eval/{env}/...`` metric dict."""
-        if not batch.rollouts:
-            get_logger().warning(f"Eval @ step={batch.step} env={batch.env_name}: no rollouts returned, skipping log")
+        if not batch.episodes:
+            get_logger().warning(f"Eval @ step={batch.step} env={batch.env_name}: no episodes returned, skipping log")
             return
 
-        await monitors.log(group_episodes(batch.rollouts.effective.rollouts), batch.step, "eval", "effective")
+        await monitors.log(batch.episodes.effective.vf_episodes, batch.step, "eval", "effective")
 
-        rollouts = batch.rollouts
-        effective = rollouts.effective
+        episodes = batch.episodes
+        effective = episodes.effective
         metrics: dict[str, float] = {}
-        for subset, pool in (("all", rollouts), ("effective", effective)):
+        for subset, pool in (("all", episodes), ("effective", effective)):
             metrics |= pool.metrics.to_wandb(prefix=f"eval/{batch.env_name}", subset=subset)
         metrics[f"eval/{batch.env_name}/policy_version"] = float(batch.step)
         metrics["step"] = float(batch.step)
         await monitors.log(metrics, step=batch.step)
 
-        eff, full = effective.metrics, rollouts.metrics
+        eff, full = effective.metrics, episodes.metrics
         triggered_at = self.eval_triggered_at.pop((batch.env_name, batch.step), None)
         elapsed = (time.perf_counter() - triggered_at) if triggered_at is not None else 0.0
         get_logger().success(
