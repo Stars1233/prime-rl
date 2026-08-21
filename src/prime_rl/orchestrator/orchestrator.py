@@ -58,6 +58,7 @@ from prime_rl.orchestrator.periodic_logger import PeriodicLogger
 from prime_rl.orchestrator.train_sink import TrainSink
 from prime_rl.orchestrator.train_source import TrainSource
 from prime_rl.orchestrator.types import (
+    Cancellation,
     EvalBatch,
     Policy,
     Progress,
@@ -65,12 +66,12 @@ from prime_rl.orchestrator.types import (
 )
 from prime_rl.orchestrator.utils import (
     episode_group_id,
+    episode_staleness,
     eval_work,
     get_weight_dir,
     intercept_vf_logging,
     set_default_executor,
     setup_policy_inference_pool,
-    train_work,
     trim_process_memory,
 )
 from prime_rl.orchestrator.watcher import WeightWatcher
@@ -412,6 +413,7 @@ class Orchestrator:
             tokenizer=self.tokenizer,
             train_envs=self.train_envs,
             mm_token_type_ids_mapping=self.mm_token_type_ids_mapping,
+            progress=self.progress,
             batch_size=config.batch_size,
             token_batch_size=config.token_batch_size,
             on_result=self.train_source.on_result,
@@ -453,13 +455,6 @@ class Orchestrator:
             wandb_enabled=wandb_enabled,
         )
 
-    def off_policy_steps(self, episode: vf.Episode, training_step: int) -> int:
-        """Policy updates between generation and the batch that trains on it."""
-        work = train_work(episode)
-        if work.policy is None:
-            return 0
-        return max(0, (training_step - 1) - work.policy.start)
-
     async def start(self) -> None:
         """Run the orchestrator until shutdown. Drives setup, spawns the
         background tasks, runs the main loop in this task, then cleans up."""
@@ -496,6 +491,7 @@ class Orchestrator:
         clean_exit = False
         try:
             await self.main_loop()
+            await self.wait_for_final_broadcast()
             clean_exit = True
         finally:
             elapsed = format_time(time.perf_counter() - start_time)
@@ -524,10 +520,44 @@ class Orchestrator:
                 get_logger().warning("Orchestrator cleanup complete (forced).")
             trim_process_memory()
 
+    async def wait_for_final_broadcast(self) -> None:
+        """Stay alive for the trainer's last in-memory broadcast (v{max_steps-1};
+        nothing samples from v{max_steps}, so it is never sent). An in-memory
+        broadcast is a blocking collective — tearing down the watcher before
+        the rendezvous would strand the trainer inside it."""
+        config = self.config
+        if config.weight_broadcast.type not in ("nccl", "nixl") or config.max_steps is None:
+            return
+        final_version = config.max_steps - 1
+        if self.policy.version >= final_version:
+            return
+        get_logger().info(f"Waiting for the trainer's final broadcast (v{final_version}) before shutdown")
+
+        async def wait() -> None:
+            while self.policy.version < final_version:
+                self.version_advanced.clear()
+                if self.policy.version >= final_version:
+                    return
+                # A dead watcher can never deliver the broadcast — fail out
+                # instead of idling until the timeout.
+                self._raise_if_component_stopped()
+                try:
+                    await asyncio.wait_for(self.version_advanced.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    pass
+
+        try:
+            await asyncio.wait_for(wait(), timeout=config.weight_broadcast.timeout)
+        except asyncio.TimeoutError:
+            get_logger().warning(
+                f"Trainer did not broadcast v{final_version} within {config.weight_broadcast.timeout}s — "
+                "shutting down anyway"
+            )
+
     async def main_loop(self) -> None:
-        """Consume completed episodes from the dispatcher and route them
-        to the train / eval sink. Both sinks return a finalized batch (or
-        ``None``) from ``add()``; we just dispatch on the result."""
+        """Consume completed episodes and group ``Cancellation``\\ s from the
+        dispatcher and route them to the train / eval sink. The sinks return a
+        finalized batch (or ``None``); we just dispatch on the result."""
         while not self.stopped.is_set():
             self._raise_if_component_stopped()
             if self.draining and self.dispatcher.is_idle:
@@ -536,10 +566,18 @@ class Orchestrator:
                 break
 
             try:
-                episode = await asyncio.wait_for(self.dispatcher.out_q.get(), timeout=0.5)
+                item = await asyncio.wait_for(self.dispatcher.out_q.get(), timeout=0.5)
             except asyncio.TimeoutError:
                 self._raise_if_component_stopped()
                 continue
+
+            if isinstance(item, Cancellation):
+                assert item.kind == "train"  # eval groups are never dropped
+                train_batch = await self.train_sink.cancel(item)
+                if train_batch is not None and not self.draining and not self.stopped.is_set():
+                    await self.finalize_train_batch(train_batch)
+                continue
+            episode = item
 
             # Every completed rollout — errored, rejected, or never batched — lands in the
             # ``all`` trace file the moment it arrives, so it survives crashes and drains.
@@ -593,14 +631,10 @@ class Orchestrator:
         step_time = (now - self.last_batch_at) if self.last_batch_at is not None else 0.0
         self.last_batch_at = now
 
+        # A resume can start past the end (checkpoint written at the final
+        # step, or a lowered ``max_steps``): never ship beyond the budget.
         if config.max_steps is not None and step > config.max_steps:
-            self.draining = True
-            self.dispatcher.disable_train_scheduling()
-            n_cancelled = await self.dispatcher.cancel_inflight_train_episodes()
-            get_logger().info(
-                f"Draining pipeline (cancelled {n_cancelled} in-flight train rollout(s); "
-                f"any in-flight evals will complete)"
-            )
+            await self.start_draining(f"Step {step} exceeds max_steps={config.max_steps}")
             return
 
         if not batch.samples:
@@ -626,11 +660,11 @@ class Orchestrator:
             )
 
         # Ship batch ``step`` only once the trainer has published v{step-1-TARGET_LAG}.
-        # Without this, fast envs fill batches from buffered rollouts, the
-        # orchestrator finishes early, and its teardown strands the trainer inside
-        # an in-memory broadcast handshake that needs the live weight watcher.
-        # Always satisfiable: the trainer skips only the final TARGET_LAG+1
-        # in-memory broadcasts.
+        # Without this, fast envs fill batches from buffered rollouts and the
+        # orchestrator races arbitrarily far ahead of the trainer. Always
+        # satisfiable: the trainer broadcasts every version except v{max_steps},
+        # and ``wait_for_final_broadcast`` keeps the watcher alive through the
+        # last rendezvous after the pipeline drains.
         required_version = step - 1 - TARGET_LAG
         if self.policy.version < required_version:
             get_logger().info(
@@ -691,6 +725,22 @@ class Orchestrator:
             "time/wait_for_policy": self.wait_for_policy_time,
             "step": step,
         }
+        # Staleness of the shipped cohort, decomposed into its in-flight and
+        # in-queue shares; ``dropped`` counts queued traces the sink voided
+        # since the last ship.
+        staleness = [episode_staleness(episode, step) for episode in effective]
+        if staleness:
+            totals, in_flight, in_queue = (list(values) for values in zip(*staleness))
+            metrics |= {
+                "off_policy/mean": sum(totals) / len(totals),
+                "off_policy/max": float(max(totals)),
+                "off_policy/in_flight/mean": sum(in_flight) / len(in_flight),
+                "off_policy/in_flight/max": float(max(in_flight)),
+                "off_policy/in_queue/mean": sum(in_queue) / len(in_queue),
+                "off_policy/in_queue/max": float(max(in_queue)),
+            }
+        metrics["off_policy/dropped"] = float(self.train_sink.stale_drops)
+        self.train_sink.stale_drops = 0
         for env_name, env_pool in batch.episodes.by_env().items():
             metrics[f"batch/{env_name}"] = env_pool.num_traces / batch.episodes.num_traces
         metrics |= self.train_source.metrics()
@@ -707,7 +757,24 @@ class Orchestrator:
         self.log_train_batch(batch, step=step, step_time=step_time)
 
         self.maybe_trigger_eval(self.progress.step)
+        # Drain right after shipping the final batch. Waiting for a further
+        # batch to fill would burn inference on data that can never train —
+        # and with a tight ``max_off_policy_steps`` it never fills at all (the
+        # versions it would need are never broadcast).
+        if config.max_steps is not None and step >= config.max_steps:
+            await self.start_draining("Shipped the final batch")
         trim_process_memory()
+
+    async def start_draining(self, reason: str) -> None:
+        """Stop scheduling train work and let the pipeline empty; triggered
+        eval epochs still run to completion."""
+        self.draining = True
+        self.dispatcher.disable_train_scheduling()
+        n_cancelled = await self.dispatcher.cancel_inflight_train_episodes()
+        get_logger().info(
+            f"{reason} — draining pipeline (cancelled {n_cancelled} in-flight "
+            f"train episode(s); any in-flight evals will complete)"
+        )
 
     def maybe_trigger_eval(self, step: int) -> None:
         """Fire eligible eval epochs and flip to ``PREFER_EVAL`` if anything
@@ -794,8 +861,12 @@ class Orchestrator:
 
     def log_train_batch(self, batch: TrainBatch, *, step: int, step_time: float) -> None:
         """Per-step ``Step …`` success line. Multi-env runs append an indented ``╰─`` line per env.
-        ``Error`` is the sink-level rate (errored arrivals / total arrivals, over the full window);
-        the quality metrics are over the effective (clean, trained-on) subset, as is ``Trainable``."""
+        Every quality metric (Reward, Trainable, Turns, Branches, Max Off-Policy, Truncation) is
+        computed over exactly the traces shipped to the trainer this step (``batch.cohort``).
+        ``Error``, ``Cancelled``, and ``Ratio`` are rates over the step's full arrival window —
+        over the shipped set they are 0/0/share-of-shipped by construction, so the window is the
+        only scope where they carry signal (and they stay disjoint: a cancellation is a pipeline
+        decision, not a rollout failure)."""
         episodes = batch.episodes
         effective = batch.cohort.effective
         eff = effective.metrics
@@ -803,14 +874,15 @@ class Orchestrator:
         n_effective = effective.num_traces
         n_trainable = sum(is_trainable(record.trace) for record in effective.records)
         trainable_rate = (n_trainable / n_effective) if n_effective else 0.0
-        max_off_policy = max((self.off_policy_steps(episode, step) for episode in effective), default=0)
+        max_off_policy_steps = max((episode_staleness(episode, step)[0] for episode in effective), default=0)
 
         head = (
             f"Step {step} | {format_time(step_time):>7} | Reward {eff.reward.mean():.4f} | "
             f"Trainable {n_trainable}/{n_effective} ({trainable_rate:.1%}) | "
             f"Turns {eff.num_turns.mean():.1f} | Branches {eff.num_branches.mean():.1f} | "
-            f"Max Off-Policy {max_off_policy} | "
-            f"Error {episodes.metrics.has_error.mean():.1%} | Truncation {eff.is_truncated.mean():.1%}"
+            f"Max Off-Policy {max_off_policy_steps} | "
+            f"Error {episodes.metrics.has_error.mean():.1%} | Cancelled {episodes.metrics.cancelled.mean():.1%} | "
+            f"Truncation {eff.is_truncated.mean():.1%}"
         )
         if len(self.train_envs) <= 1:
             get_logger().success(head)
@@ -829,8 +901,9 @@ class Orchestrator:
             lines.append(
                 f"╰─ {env_name:<{name_width}} | Ratio {ratio:.1%} | Reward {env_eff.reward.mean():.4f} | "
                 f"Turns {env_eff.num_turns.mean():.1f} | Branches {env_eff.num_branches.mean():.1f} | "
-                f"Max Off-Policy {max((self.off_policy_steps(episode, step) for episode in env_eff_pool), default=0)} | "
-                f"Error {pool.metrics.has_error.mean():.1%} | Truncation {env_eff.is_truncated.mean():.1%}"
+                f"Max Off-Policy {max((episode_staleness(episode, step)[0] for episode in env_eff_pool), default=0)} | "
+                f"Error {pool.metrics.has_error.mean():.1%} | Cancelled {pool.metrics.cancelled.mean():.1%} | "
+                f"Truncation {env_eff.is_truncated.mean():.1%}"
             )
         get_logger().success("\n\t\t ".join(lines))
 
@@ -902,16 +975,9 @@ class Orchestrator:
         are 1-indexed while policy versions stay 0-indexed, so the shipped-batch
         count is ``progress.step - 1``."""
         lead = (self.progress.step - 1) - self.policy.version
-        # The trainer skips the final in-memory weight broadcasts, so policy.version never
-        # reaches the last step. Let the final batch through instead of waiting for it.
-        building_final_batch_without_update = (
-            self.config.weight_broadcast.type in ("nccl", "nixl")
-            and self.config.max_steps is not None
-            and self.progress.step >= self.config.max_steps - 1
-        )
         gate = self.dispatcher.dispatch_allowed
         was_set = gate.is_set()
-        if lead > TARGET_LAG and not building_final_batch_without_update:
+        if lead > TARGET_LAG:
             if was_set:
                 get_logger().info(
                     "Pausing dispatcher to prevent orchestrator from racing from trainer. Waiting for new policy..."
