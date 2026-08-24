@@ -12,7 +12,7 @@ const api = async (path) => {
 /* accent-first line palette, then the prime-context chart palette */
 const PALETTE = ["#b6ff3c", "#b7a6fa", "#78f8a5", "#fcdaa4", "#4a9eff", "#ff6b4a", "#bcbcbc"];
 const SINGLE_SERIES = "#b6ff3c";
-const POLL_MS = 3000;
+const POLL_MS = 5000;
 const prefs = JSON.parse(localStorage.getItem("prl-dash") || "{}");
 
 const state = {
@@ -49,7 +49,7 @@ const state = {
 };
 
 function fmtNum(v) {
-  if (v == null || Number.isNaN(v)) return "–";
+  if (v == null || Number.isNaN(v)) return "n/a";
   if (v === 0) return "0";
   const abs = Math.abs(v);
   if (abs >= 1e6 || abs < 1e-3) return v.toExponential(2);
@@ -57,10 +57,10 @@ function fmtNum(v) {
   if (Number.isInteger(v)) return String(v);
   return v.toPrecision(4).replace(/(\.\d*?)0+$/, "$1").replace(/\.$/, "");
 }
-const fmtReward = (v) => (v == null || Number.isNaN(v) ? "–" : v.toFixed(3));
+const fmtReward = (v) => (v == null || Number.isNaN(v) ? "n/a" : v.toFixed(3));
 /* compact human counts that never overflow: 1.1K, 2.2M, 3.3B */
 function fmtCompact(n) {
-  if (n == null || Number.isNaN(n)) return "–";
+  if (n == null || Number.isNaN(n)) return "n/a";
   const abs = Math.abs(n);
   if (abs >= 1e9) return `${+(n / 1e9).toFixed(abs >= 1e10 ? 0 : 1)}B`;
   if (abs >= 1e6) return `${+(n / 1e6).toFixed(abs >= 1e7 ? 0 : 1)}M`;
@@ -68,7 +68,7 @@ function fmtCompact(n) {
   return String(n);
 }
 function fmtCost(v) {
-  if (v == null || Number.isNaN(v)) return "–";
+  if (v == null || Number.isNaN(v)) return "n/a";
   return `$${v >= 1 ? v.toFixed(2) : v.toFixed(4)}`;
 }
 
@@ -120,7 +120,7 @@ async function loadRuns() {
   syncDressedSelects();
   const fresh = state.runs.find((r) => r.name === current);
   if (fresh && state.meta) {
-    Object.assign(state.meta, { updated: fresh.updated, started: fresh.started, last_step: fresh.last_step });
+    Object.assign(state.meta, fresh);
     renderOverview();
   }
 }
@@ -167,9 +167,8 @@ function applyRunTypeControls() {
   $("#trace-subset").hidden = isEval;
   $("#tm-step-prev").hidden = isEval;
   $("#tm-step-next").hidden = isEval;
-  $("#tm-kind").hidden = isEval || state.meta?.type === "sft";
-  $("#tm-subset").hidden = isEval;
-  $(".tm-filterhead").hidden = isEval;
+  $("#tm-kind-row").hidden = isEval || state.meta?.type === "sft";
+  $("#tm-subset-row").hidden = isEval;
 }
 
 async function selectRun(name) {
@@ -181,14 +180,18 @@ async function selectRun(name) {
   state.meta = state.runs.find((r) => r.name === name) ?? (await api(`/api/runs/${encodeURIComponent(name)}`));
   state.metrics = {
     ...state.metrics,
-    loaded: false, offset: 0, byKey: new Map(), charts: [], renderedKeys: -1,
+    loaded: false, fetching: false, offset: 0, byKey: new Map(), charts: [], renderedKeys: -1,
     timeKeys: new Set(), timeZero: null, maxStep: null,
     evalEtag: null, evalCount: 0, evalCost: null,
   };
   if (state.meta?.type === "eval") fetchEvalSeries(); // populates the overview cost early
   state.config = { loaded: false, files: [], file: null, fmt: state.config.fmt, cache: new Map() };
   state.logs = { ...state.logs, loaded: false, attempt: "latest", files: [], paneFile: {}, maximized: null, buffers: new Map() };
-  state.traces = { ...state.traces, loaded: false, steps: [], step: null, env: "", episodes: [], etag: null, kind: "train", subset: state.traces.preferred };
+  state.traces = {
+    ...state.traces,
+    loaded: false, fetching: false, steps: [], step: null, env: "", episodes: [], etag: null,
+    kind: "train", subset: state.traces.preferred,
+  };
   applyRunTypeControls();
   renderOverview();
   renderCompareMenu();
@@ -197,7 +200,7 @@ async function selectRun(name) {
 }
 
 function fmtDuration(secs) {
-  if (secs == null || !isFinite(secs) || secs < 0) return "–";
+  if (secs == null || !isFinite(secs) || secs < 0) return "n/a";
   const d = Math.floor(secs / 86400);
   const h = Math.floor((secs % 86400) / 3600);
   const m = Math.floor((secs % 3600) / 60);
@@ -211,7 +214,7 @@ function fmtDuration(secs) {
 }
 
 function fmtAgo(ts) {
-  if (!ts) return "–";
+  if (!ts) return "n/a";
   const secs = Date.now() / 1000 - ts;
   if (secs < 90) return "just now";
   if (secs < 3600) return `${Math.round(secs / 60)} min ago`;
@@ -233,8 +236,8 @@ function runStatus(step) {
 
 /* unbounded env lists: show the first two, fold the rest into "+N" (full list
    in the tooltip) */
-function envListField(envs) {
-  if (!envs?.length) return `<span class="val">–</span>`;
+function envListField(envs, empty = "n/a") {
+  if (!envs?.length) return `<span class="val">${empty}</span>`;
   const display = envs.length > 2 ? `${envs.slice(0, 2).join(", ")} +${envs.length - 2}` : envs.join(", ");
   return `<span class="val" title="${esc(envs.join(", "))}">${esc(display)}</span>`;
 }
@@ -250,7 +253,7 @@ function renderOverview() {
   const step = currentStep();
   const status = runStatus(step);
   const durationEnd = status === "running" ? Date.now() / 1000 : meta.updated;
-  const duration = meta.started && durationEnd ? fmtDuration(durationEnd - meta.started) : "–";
+  const duration = meta.started && durationEnd ? fmtDuration(durationEnd - meta.started) : "n/a";
   const field = ([label, value]) => `<div class="ov-field"><span class="lbl">${label}</span>${value}</div>`;
   // rollout dirs can run one step past max_steps (the final ship drains late
   // arrivals), so the headline caps at the configured horizon
@@ -258,18 +261,19 @@ function renderOverview() {
   const stepText = `${shownStep != null ? shownStep.toLocaleString() : "–"}/${meta.max_steps ? meta.max_steps.toLocaleString() : "∞"}`;
   const left = [
     ["status", `<span class="badge st-${status}">${status}</span>`],
-    ["type", `<span class="val">${esc((meta.type ?? "–").toUpperCase())}</span>`],
+    ["type", `<span class="val">${esc((meta.type ?? "n/a").toUpperCase())}</span>`],
     meta.type === "eval"
-      ? ["episodes", `<span class="val">${step != null ? step.toLocaleString() : "–"}</span>`]
+      ? ["episodes", `<span class="val">${step != null ? step.toLocaleString() : "n/a"}</span>`]
       : ["step", `<span class="val">${stepText}</span>`],
-    ["model", `<span class="val" title="${esc(meta.model ?? "")}">${esc(meta.model ?? "–")}</span>`],
+    ["model", `<span class="val" title="${esc(meta.model ?? "")}">${esc(meta.model ?? "n/a")}</span>`],
     ...(meta.type === "eval"
-      ? [["env", `<span class="val" title="${esc(meta.env ?? "")}">${esc(meta.env ?? "–")}</span>`]]
+      ? [["env", `<span class="val" title="${esc(meta.env ?? "")}">${esc(meta.env ?? "n/a")}</span>`]]
       : [
           meta.type === "sft"
-            ? ["dataset", `<span class="val" title="${esc(meta.dataset ?? "")}">${esc(meta.dataset ?? "–")}</span>`]
+            ? ["dataset", `<span class="val" title="${esc(meta.dataset ?? "")}">${esc(meta.dataset ?? "n/a")}</span>`]
             : ["train envs", envListField(meta.train_envs)],
-          ["eval envs", envListField(meta.eval_envs)],
+          // an empty eval env list is a known "none", not missing data
+          ["eval envs", envListField(meta.eval_envs, "–")],
         ]),
   ];
   const right = [
@@ -297,10 +301,16 @@ async function activateTab(tab, force = false) {
   setActive("#tabs", "tab", tab);
   document.querySelectorAll("main > section").forEach((s) => (s.hidden = s.id !== `tab-${tab}`));
   updateHash();
-  if (tab === "metrics" && !state.metrics.loaded) await initMetrics();
+  if (tab === "metrics") {
+    if (!state.metrics.loaded) await initMetrics();
+    else if (state.live) await fetchMetrics();
+  }
   if (tab === "config" && !state.config.loaded) await initConfig();
   if (tab === "logs" && !state.logs.loaded) await initLogs();
-  if (tab === "traces" && !state.traces.loaded) await initTraces();
+  if (tab === "traces") {
+    if (!state.traces.loaded) await initTraces();
+    else if (state.live) await refreshTraces();
+  }
 }
 
 /* ---------------------------------------------------------------- metrics */
@@ -384,6 +394,7 @@ async function fetchMetrics() {
   let showedProgress = false;
   try {
     for (let first = true; ; first = false) {
+      const requestedOffset = m.offset;
       const [data, compared] = await Promise.all([
         api(`/api/runs/${encodeURIComponent(state.run)}/metrics?offset=${m.offset}`),
         first ? fetchCompares() : false,
@@ -400,7 +411,9 @@ async function fetchMetrics() {
         if (m.byKey.size !== m.renderedKeys) renderMetricsBody();
         else updateCharts(compared ? null : touched); // compares may touch any panel
       }
-      if (data.offset >= (data.size ?? data.offset)) break;
+      // A writer can leave one incomplete JSONL record at EOF. Wait for the
+      // next poll instead of repeatedly requesting the same partial record.
+      if (data.offset >= (data.size ?? data.offset) || data.offset === requestedOffset) break;
       showedProgress = true;
       $("#metrics-status").textContent = `loading metrics · ${Math.round((data.offset / data.size) * 100)}%`;
     }
@@ -464,7 +477,7 @@ function renderEvalCards(body) {
     );
   }
   const fmtVal = (key, v) => {
-    if (v == null) return "–";
+    if (v == null) return "n/a";
     if (key === "cost") return fmtCost(v);
     if (key.startsWith("timing/")) return fmtDuration(v);
     if (key.endsWith("tokens")) return fmtCompact(Math.round(v));
@@ -1107,7 +1120,7 @@ function renderMetricsBody() {
   if (state.meta?.type === "eval") return renderEvalCards(body);
   activeFilter = makeFilter(state.metrics.search.trim());
   if (!state.meta?.has_metrics && !m.byKey.size) {
-    body.innerHTML = emptyState("no metrics", "this run has no metrics.jsonl yet");
+    body.innerHTML = emptyState("no metrics yet");
     $("#metrics-status").textContent = "";
     return;
   }
@@ -1121,7 +1134,7 @@ function renderMetricsBody() {
       }
       if (!grid.children.length) {
         // a configured eval env stays visible before its first eval fires
-        if (section.configured && !activeFilter) grid.innerHTML = `<div class="chart-empty">no eval data yet</div>`;
+        if (section.configured && !activeFilter) grid.innerHTML = `<div class="chart-empty">no data yet</div>`;
         else div.remove();
       } else applyPaneOrder(grid);
     }
@@ -1726,26 +1739,25 @@ async function initLogs() {
 
 async function loadRollouts() {
   const traces = state.traces;
+  const previousTarget = latestPreferredStep(traces.steps, traces.kind, traces.preferred);
+  const wasFollowing = traces.step == null || traces.step === previousTarget?.step;
   const data = await api(`/api/runs/${encodeURIComponent(state.run)}/rollouts`);
   traces.steps = data.steps;
-  if (traces.step == null && data.steps.length) {
-    // default to the newest step that already shipped the preferred subset —
-    // the newest step is usually in-flight with only "all" (no advantages yet)
-    const preferred = traces.preferred;
-    const newestFirst = [...data.steps].reverse();
-    const shipped =
-      newestFirst.find((s) => s.available[`${traces.kind}/${preferred}`]) ??
-      newestFirst.find((s) => Object.keys(s.available).some((k) => k.endsWith(`/${preferred}`)));
-    traces.step = (shipped ?? data.steps[data.steps.length - 1]).step;
-    adjustKindSubset();
-  } else if (traces.step != null) {
-    // the preferred subset may have shipped since the last poll (a live step's
-    // effective file lands late) — re-adjust and reload when it changes
-    const before = `${traces.kind}/${traces.subset}`;
-    adjustKindSubset();
-    if (`${traces.kind}/${traces.subset}` !== before) await loadEpisodes();
-  }
+  const target = latestPreferredStep(data.steps, traces.kind, traces.preferred);
+  // Follow new work while the user is on the latest preferred step. Keep a
+  // manually selected historical step stable, especially while its modal is open.
+  if (target && wasFollowing && $("#trace-modal").hidden) traces.step = target.step;
+  adjustKindSubset();
   renderStepControl();
+}
+
+function latestPreferredStep(steps, kind, preferred) {
+  const newestFirst = [...steps].reverse();
+  return (
+    newestFirst.find((s) => s.available[`${kind}/${preferred}`]) ??
+    newestFirst.find((s) => Object.keys(s.available).some((key) => key.endsWith(`/${preferred}`))) ??
+    newestFirst[0]
+  );
 }
 
 function stepInfo(step) {
@@ -1793,6 +1805,7 @@ function renderStepControl() {
         ` title="${title}${hasEval ? " · eval" : ""}"></span>`
     );
   }
+  if (!cells.length) cells.push(`<span class="sb-cell placeholder"></span>`);
   const signature = cells.join("");
   if (signature === traces.stepControlSignature) return;
   traces.stepControlSignature = signature;
@@ -1803,7 +1816,7 @@ function renderStepControl() {
   const hasEval = info && (info.available["eval/all"] || info.available["eval/effective"]);
   $("#step-label").innerHTML =
     traces.step == null
-      ? ""
+      ? `<span class="muted">no steps yet</span>`
       : `step ${traces.step}${steps.length > 1 ? `<span class="muted">/${steps[steps.length - 1].step}</span>` : ""}` +
         (hasEval ? ' <span class="eval-dot" title="eval rollouts"></span>' : "");
 }
@@ -1817,19 +1830,18 @@ function selectStepByIndex(index) {
   loadEpisodes();
 }
 
+// the table chrome stays in place; the message renders as a spanning row so
+// arriving traces cause no layout shift
 function showTraceEmpty(title, detail) {
-  $("#episode-table-wrap").hidden = true;
-  const el = $("#trace-empty");
-  el.hidden = false;
-  el.innerHTML = emptyState(title, detail);
+  $("#episode-table tbody").innerHTML = `<tr class="empty"><td colspan="10">${emptyState(title, detail)}</td></tr>`;
 }
 
 async function loadEpisodes() {
   const traces = state.traces;
-  updateTraceFilterBtn();
+  syncTraceFilterControls();
   if (traces.step == null) {
     $("#trace-status").textContent = "";
-    showTraceEmpty("no traces", "this run has no saved traces yet");
+    showTraceEmpty("no traces yet");
     return;
   }
   const qs = new URLSearchParams({ sort: traces.sort, order: traces.order, errors_only: traces.errorsOnly });
@@ -1851,13 +1863,12 @@ async function loadEpisodes() {
   traces.etag = data.etag;
   traces.etagKey = etagKey;
   traces.episodes = data.episodes;
-  $("#trace-empty").hidden = true;
-  $("#episode-table-wrap").hidden = false;
-  const envSel = $("#trace-env");
   const currentEnv = traces.env;
-  envSel.innerHTML =
-    `<option value="">all envs</option>` +
-    data.envs.map((e) => `<option value="${esc(e)}" ${e === currentEnv ? "selected" : ""}>${esc(e)}</option>`).join("");
+  for (const sel of ["#trace-env", "#tm-env"])
+    $(sel).innerHTML =
+      `<option value="">all envs</option>` +
+      data.envs.map((e) => `<option value="${esc(e)}" ${e === currentEnv ? "selected" : ""}>${esc(e)}</option>`).join("");
+  syncDressedSelects();
   if (!data.total) {
     $("#trace-status").textContent = "";
     showTraceEmpty("no episodes", "nothing matches the current filters");
@@ -1914,9 +1925,20 @@ function renderEpisodeRows(reset = false) {
 
 async function initTraces() {
   state.traces.loaded = true;
-  await loadRollouts();
-  adjustKindSubset();
-  await loadEpisodes();
+  await refreshTraces();
+}
+
+async function refreshTraces() {
+  const traces = state.traces;
+  if (traces.fetching) return;
+  traces.fetching = true;
+  try {
+    await loadRollouts();
+    if (state.traces !== traces) return;
+    await loadEpisodes();
+  } finally {
+    traces.fetching = false;
+  }
 }
 
 /* ----------------------------------------------------------- episode view */
@@ -1946,7 +1968,7 @@ function filteredRollouts() {
 
 function tmItemHtml(e) {
   return (
-    `<div class="tm-item ${e.line === currentLine ? "active" : ""}" data-line="${e.line}">` +
+    `<div class="tm-item ${e.line === currentLine ? "active" : ""}${e.num_errors || !e.ok ? " err" : ""}" data-line="${e.line}">` +
     `<span class="tm-num">#${e.line}</span><span class="tm-env muted" title="${esc(e.env ?? "")}">${esc(e.env ?? "")}</span>` +
     `<span class="tm-reward ${rewardClass(e.reward)}">${fmtReward(e.reward)}</span></div>`
   );
@@ -2185,11 +2207,40 @@ function reasoningBlock(content) {
 
 let entriesObserver = null;
 
-function renderMessages(trace, branches) {
+function episodeErrors(ep, trace) {
+  return [...(ep.errors || []), ...(trace?.errors || [])];
+}
+
+function errorBannersHtml(errors) {
+  if (!errors.length) return "";
+  return (
+    `<div class="trace-errors">` +
+    errors
+      .map((error) => {
+        const record = error && typeof error === "object" ? error : { message: String(error) };
+        const type = record.type ?? "Error";
+        const message = record.message ?? "No error message";
+        const traceback = Array.isArray(record.traceback) ? record.traceback.join("") : record.traceback;
+        return (
+          `<section class="trace-error-banner">` +
+          `<div class="trace-error-message"><span class="trace-error-type">${esc(type)}</span> ${esc(message)}</div>` +
+          (traceback
+            ? `<details class="trace-error-tb"><summary><span>traceback</span><span class="entry-chev">›</span></summary><pre>${esc(traceback)}</pre></details>`
+            : "") +
+          `</section>`
+        );
+      })
+      .join("") +
+    `</div>`
+  );
+}
+
+function renderMessages(ep, trace, branches) {
   const container = $("#tm-messages");
   entriesObserver?.disconnect();
+  const errorsHtml = errorBannersHtml(episodeErrors(ep, trace));
   if (!trace) {
-    container.innerHTML = emptyState("no traces", "this episode carries no trace data");
+    container.innerHTML = emptyState("no traces", "this episode carries no trace data") + errorsHtml;
     return;
   }
   const signal = $("#token-signal").value;
@@ -2235,7 +2286,8 @@ function renderMessages(trace, branches) {
   let rendered = Math.min(path.length, CHUNK);
   container.innerHTML =
     path.slice(0, rendered).map(entryHtml).join("") +
-    (rendered < path.length ? `<div id="tm-more" class="chart-empty">scroll for ${path.length - rendered} more entries</div>` : "");
+    (rendered < path.length ? `<div id="tm-more" class="chart-empty">scroll for ${path.length - rendered} more entries</div>` : "") +
+    errorsHtml;
   if (rendered < path.length) {
     const sentinel = container.querySelector("#tm-more");
     entriesObserver = new IntersectionObserver((hits) => {
@@ -2361,14 +2413,8 @@ function renderMeta(ep, trace, branches) {
   parts.push(metaRow("episode ID", ep.id, true));
   if (trace?.id) parts.push(metaRow("trace ID", trace.id, true));
   if (ep.group?.id) parts.push(metaRow("group ID", ep.group.id, true));
+  if (ep.task?.key) parts.push(metaRow("task ID", ep.task.key, true));
   if (trace?.agent?.runtime?.id) parts.push(metaRow("runtime ID", trace.agent.runtime.id, true));
-
-  const errors = [...(ep.errors || []), ...(trace?.errors || [])];
-  if (errors.length)
-    parts.push(
-      `<details class="meta-fold" open><summary>errors (${errors.length})</summary>` +
-        `<pre class="json">${esc(JSON.stringify(errors, null, 2))}</pre></details>`
-    );
 
   $("#tm-meta").innerHTML = parts.join("");
 }
@@ -2404,14 +2450,17 @@ function renderEpisode() {
       : "";
   $("#tm-tabs-row").hidden = traceTabs.hidden && branchTabs.hidden;
   renderRolloutList();
-  renderMessages(trace, branches);
+  renderMessages(ep, trace, branches);
   renderMeta(ep, trace, branches);
 }
 
 /* ---------------------------------------------------------------- wiring */
 
 $("#run-select").addEventListener("change", (e) => selectRun(e.target.value));
-$("#live-toggle").addEventListener("change", (e) => (state.live = e.target.checked));
+$("#live-toggle").addEventListener("change", async (e) => {
+  state.live = e.target.checked;
+  if (state.live) await pollDashboard();
+});
 $("#compare-menu").addEventListener("change", (e) => {
   const box = e.target.closest("[data-compare]");
   if (box) toggleCompare(box.dataset.compare, box.checked);
@@ -2480,9 +2529,16 @@ function dressSelect(select) {
   dressedSelects.add(select);
   syncDressedSelects();
 }
-function updateTraceFilterBtn() {
+/* the table and the trace viewer carry the same filter dropdown over one
+   shared state — a change in either view shows up in both */
+function syncTraceFilterControls() {
   const t = state.traces;
-  $("#trace-filter-btn").classList.toggle("active", !!(t.env || t.errorsOnly || t.sort !== "line"));
+  for (const sel of ["#trace-env", "#tm-env"]) $(sel).value = t.env;
+  for (const sel of ["#trace-sort", "#tm-sort"]) $(sel).value = `${t.sort}:${t.order}`;
+  for (const sel of ["#trace-errors", "#tm-errors"]) $(sel).checked = t.errorsOnly;
+  for (const sel of ["#trace-filter-btn", "#tm-filter-btn"])
+    $(sel).classList.toggle("active", !!(t.env || t.errorsOnly || t.sort !== "line"));
+  syncDressedSelects();
 }
 
 document.querySelectorAll("#tabs button").forEach((b) => b.addEventListener("click", () => activateTab(b.dataset.tab)));
@@ -2717,6 +2773,14 @@ async function setTraceSubset(subset, inModal = false) {
   if (inModal) await reopenFirstEpisode();
 }
 
+/* filter changes keep the open viewer in sync: hold the current episode when
+   it survives the filter, land on the first one otherwise */
+async function refreshModalList() {
+  if ($("#trace-modal").hidden) return;
+  if (filteredRollouts().some((e) => e.line === currentLine)) renderRolloutList();
+  else await reopenFirstEpisode();
+}
+
 /* after a filter change inside the viewer, land on the first episode of the
    new subset (line numbers don't correspond across files) */
 async function reopenFirstEpisode() {
@@ -2744,13 +2808,26 @@ for (const [sel, inModal] of [["#trace-subset", false], ["#tm-subset", true]])
       setTraceSubset(b.dataset.subset, inModal);
     })
   );
-$("#trace-env").addEventListener("change", (e) => { state.traces.env = e.target.value; loadEpisodes(); });
-$("#trace-errors").addEventListener("change", (e) => { state.traces.errorsOnly = e.target.checked; loadEpisodes(); savePrefs(); });
-$("#trace-sort").addEventListener("change", (e) => {
-  [state.traces.sort, state.traces.order] = e.target.value.split(":");
-  loadEpisodes();
-  savePrefs();
-});
+for (const sel of ["#trace-env", "#tm-env"])
+  $(sel).addEventListener("change", async (e) => {
+    state.traces.env = e.target.value;
+    await loadEpisodes();
+    await refreshModalList();
+  });
+for (const sel of ["#trace-errors", "#tm-errors"])
+  $(sel).addEventListener("change", async (e) => {
+    state.traces.errorsOnly = e.target.checked;
+    await loadEpisodes();
+    savePrefs();
+    await refreshModalList();
+  });
+for (const sel of ["#trace-sort", "#tm-sort"])
+  $(sel).addEventListener("change", async (e) => {
+    [state.traces.sort, state.traces.order] = e.target.value.split(":");
+    await loadEpisodes();
+    savePrefs();
+    await refreshModalList();
+  });
 $("#episode-table").addEventListener("click", (e) => {
   const row = e.target.closest("tr[data-line]");
   if (row) openEpisode(+row.dataset.line);
@@ -2817,8 +2894,6 @@ $("#tm-list").addEventListener("click", (e) => {
   const item = e.target.closest("[data-line]");
   if (item) openEpisode(+item.dataset.line);
 });
-$("#tm-prev").addEventListener("click", () => stepRollout(-1));
-$("#tm-next").addEventListener("click", () => stepRollout(1));
 $("#tm-collapse").addEventListener("click", () =>
   document.querySelectorAll("#tm-messages details.entry").forEach((d) => (d.open = false))
 );
@@ -2885,12 +2960,10 @@ $("#smooth-range").addEventListener("input", (e) => {
   savePrefs();
 });
 
-let tickCount = 0;
 let ticking = false;
-setInterval(async () => {
+async function pollDashboard() {
   if (!state.live || ticking) return;
   ticking = true;
-  tickCount++;
   try {
     // keep the run list fresh so new runs register without a page refresh;
     // it runs concurrently with the tab poll (they're independent requests)
@@ -2905,17 +2978,19 @@ setInterval(async () => {
     syncDressedSelects();
     if (state.tab === "metrics" && state.metrics.loaded) await fetchMetrics();
     else if (state.tab === "logs" && state.logs.loaded) await pollLogs();
-    else if (state.tab === "traces" && state.traces.loaded) {
-      await loadRollouts();
-      if (tickCount % 5 === 0) await loadEpisodes();
-    }
+    else if (state.tab === "traces" && state.traces.loaded) await refreshTraces();
     await runsRefresh;
   } catch (err) {
     console.warn("poll failed", err);
   } finally {
     ticking = false;
   }
-}, POLL_MS);
+}
+
+setInterval(pollDashboard, POLL_MS);
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) pollDashboard();
+});
 
 (async function init() {
   $("#smooth-range").value = state.metrics.smooth;
@@ -2926,10 +3001,9 @@ setInterval(async () => {
   $("#log-search").value = prefs.logSearch ?? "";
   $("#config-search").value = prefs.configSearch ?? "";
   $("#token-signal").value = prefs.tokenSignal ?? "";
-  for (const sel of ["#run-select", "#trace-env", "#trace-sort", "#attempt-select", "#token-signal"])
+  for (const sel of ["#run-select", "#trace-env", "#trace-sort", "#tm-env", "#tm-sort", "#attempt-select", "#token-signal"])
     dressSelect($(sel));
-  $("#trace-sort").value = `${state.traces.sort}:${state.traces.order}`;
-  $("#trace-errors").checked = state.traces.errorsOnly;
+  syncTraceFilterControls();
   setActive("#metrics-mode", "mode", state.metrics.mode);
   setActive("#all-layout", "layout", state.metrics.allLayout);
   $("#all-layout").hidden = state.metrics.mode !== "all";
