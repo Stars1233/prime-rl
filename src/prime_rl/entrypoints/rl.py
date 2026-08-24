@@ -14,6 +14,7 @@ from prime_rl.configs.algorithm import FrozenModelConfig
 from prime_rl.configs.inference import VllmRouterConfig
 from prime_rl.configs.orchestrator import EnvConfig
 from prime_rl.configs.rl import RLConfig
+from prime_rl.entrypoints.dashboard import ensure_dashboard, log_dashboard_url
 from prime_rl.entrypoints.inference import vllm_overrides_fragment
 from prime_rl.utils.config import cli, dump_resolved_config
 from prime_rl.utils.logger import get_logger, setup_logger
@@ -128,6 +129,8 @@ def rl_local(config: RLConfig):
     if config.dry_run:
         logger.success("Dry run complete. To start an RL run locally, remove --dry-run from your command.")
         return
+
+    dashboard_url = ensure_dashboard(config.output_dir, logger) if config.dashboard else None
 
     # Derive launcher-local GPU IDs from deployment config
     gpu_offset = 0
@@ -367,14 +370,8 @@ def rl_local(config: RLConfig):
         monitor_thread.start()
         monitor_threads.append(monitor_thread)
 
-        # Monitor all processes for failures
-        logger.success("Startup complete. Showing orchestrator logs...")
-
-        tail_process = Popen(
-            f"tail -F '{log_dir / 'orchestrator.log'}'",
-            shell=True,
-        )
-        processes.append(tail_process)
+        logger.success("Launcher complete")
+        log_dashboard_url(logger, dashboard_url)
 
         # Check for errors from monitor threads
         while not (stop_events["orchestrator"].is_set() and stop_events["trainer"].is_set()):
@@ -604,6 +601,8 @@ def rl_slurm(config: RLConfig):
         logger.success(f"Dry run complete. To submit manually:\n\n  sbatch {script_path}\n\n{log_message}")
         return
 
+    dashboard_url = ensure_dashboard(config.output_dir, logger) if config.dashboard else None
+
     logger.info(f"Submitting: sbatch {script_path}")
     result = subprocess.run(["sbatch", str(script_path)], capture_output=True, text=True)
     if result.returncode != 0:
@@ -611,6 +610,7 @@ def rl_slurm(config: RLConfig):
         sys.exit(1)
 
     logger.success(f"{result.stdout.strip()}\n\n{log_message}")
+    log_dashboard_url(logger, dashboard_url)
 
 
 def rl(config: RLConfig):

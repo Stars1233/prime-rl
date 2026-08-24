@@ -12,6 +12,7 @@ from prime_rl.configs.evals import EvalsConfig, OnlineConfig
 from prime_rl.configs.orchestrator import EvalSourceConfig
 from prime_rl.configs.sft import SFTConfig
 from prime_rl.configs.shared import LogConfig
+from prime_rl.entrypoints.dashboard import ensure_dashboard, log_dashboard_url
 from prime_rl.utils.config import cli, dump_resolved_config, find_package_resource
 from prime_rl.utils.logger import setup_logger
 from prime_rl.utils.pathing import (
@@ -322,6 +323,8 @@ def sft_slurm(config: SFTConfig):
         logger.success(f"Dry run complete. To submit manually:\n\n{submit}{note}\n\n{log_message}")
         return
 
+    dashboard_url = ensure_dashboard(config.output_dir, logger) if config.dashboard else None
+
     submitted_job_ids: list[str] = []
     for path in script_paths:
         # --parsable prints ``<job_id>[;<cluster>]`` — the human-readable format varies
@@ -346,6 +349,7 @@ def sft_slurm(config: SFTConfig):
         logger.success(f"Submitted batch job {job_id}")
 
     logger.success(log_message)
+    log_dashboard_url(logger, dashboard_url)
 
 
 def sft_local(config: SFTConfig):
@@ -367,6 +371,8 @@ def sft_local(config: SFTConfig):
     if config.dry_run:
         logger.success("Dry run complete. To start an SFT run locally, remove --dry-run from your command.")
         return
+
+    dashboard_url = ensure_dashboard(config.output_dir, logger) if config.dashboard else None
 
     log_dir = create_attempt_log_dir(config.run_dir)
 
@@ -506,12 +512,8 @@ def sft_local(config: SFTConfig):
             trainer_env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, trainer_gpu_ids))
         trainer_process = start_process("trainer", trainer_cmd, env=trainer_env, log_path=log_dir / "trainer.log")
 
-        logger.success("Startup complete. Showing trainer logs...")
-        tail_process = Popen(
-            f"tail -F '{log_dir / 'trainer.log'}' | sed -u 's/^\\[[a-zA-Z]*[0-9]*\\]://'",
-            shell=True,
-        )
-        processes.append(tail_process)
+        logger.success("Launcher complete")
+        log_dashboard_url(logger, dashboard_url)
 
         # Wait for the trainer (and the evals process, which drains its final evals after
         # the trainer's last checkpoint) while surfacing any process failure.
