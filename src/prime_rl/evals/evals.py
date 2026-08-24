@@ -93,6 +93,7 @@ class Evals:
 
         get_logger().info(f"Initializing monitors ({config.monitors})")
         await monitors.setup(
+            producer="evals",
             wandb=config.monitors.wandb,
             file=config.monitors.file,
             output_dir=config.output_dir,
@@ -167,11 +168,10 @@ class Evals:
             get_inflight=lambda: self.dispatcher.current_inflight,
         )
         # The collector always polls — it feeds the concurrency controller;
-        # W&B mirroring is gated on the registered monitor.
+        # metrics fan out to every registered monitor.
         self.inference_metrics = InferenceMetricsCollector(
             self.admin_clients.clients,
             on_load=self.concurrency.observe,
-            log_to_wandb=wandb_enabled,
         )
         # Fail fast when adaptivity has no signal: external API endpoints
         # (e.g. Prime Inference) expose no vLLM /metrics, so without a probe

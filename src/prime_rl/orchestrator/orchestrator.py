@@ -212,6 +212,7 @@ class Orchestrator:
         self.admin_clients = AdminClients(config.model.client)
 
         await monitors.setup(
+            producer="orch",
             wandb=config.monitors.wandb,
             prime=config.monitors.prime,
             file=config.monitors.file,
@@ -363,13 +364,12 @@ class Orchestrator:
             on_overload=self.dispatcher.cancel_inflight,
         )
         # The collector always polls — it feeds the concurrency controller;
-        # W&B mirroring is gated on the registered monitor (the collector logs
-        # to the global W&B session, which only exists when init succeeded).
+        # metrics fan out to every registered monitor when collection is on.
         self.inference_metrics = InferenceMetricsCollector(
             self.admin_clients.clients,
             roles=config.inference_metrics_roles,
             on_load=self.concurrency.observe,
-            log_to_wandb=wandb_enabled and config.collect_inference_metrics,
+            log_metrics=config.collect_inference_metrics,
         )
         await self.inference_metrics.start()
         # One awaited scrape so the concurrency controller derives (and logs) its

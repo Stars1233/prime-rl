@@ -55,11 +55,16 @@ trainer = "prime_rl.entrypoints.trainer:main"
 orchestrator = "prime_rl.entrypoints.orchestrator:main"
 evals = "prime_rl.entrypoints.evals:main"
 env-server = "prime_rl.entrypoints.env_server:main"
+dashboard = "prime_rl.dashboard.server:main"
 
 [project.entry-points."vllm.general_plugins"]
 prime_rl = "prime_rl.inference.patches:apply_shared_vllm_patches"
 
 [project.optional-dependencies]
+dashboard = [
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+]
 # Both wheels are the same flash-attn 2.8.3 / cu128 / torch 2.11 / cp312 build and carry
 # sm_80 / sm_90 / sm_100 / sm_120 cubins. `attn="auto"` picks FA4 on sm_100 and FA3 on
 # sm_90, so FA2 is the resolved backend on sm_120 (see `_resolve_attn_impl` in
@@ -107,6 +112,7 @@ dev = [
     "ipykernel>=6.29.5",
     "ipywidgets>=8.1.7",
     "pre-commit>=4.2.0",
+    "playwright>=1.49",
     "pytest>=8.4.1",
     "pytest-asyncio>=0.23",
     "ruff>=0.12.1",
