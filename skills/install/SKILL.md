@@ -22,7 +22,7 @@ git submodule update --init --recursive
 ## Sync
 
 ```bash
-uv sync                                    # core only
+uv sync                                    # slim
 uv sync --group dev                        # + pytest, ruff, pre-commit
 uv sync --all-extras                       # + extras (flash-attn, flash-attn-cute, …)
 uv sync --all-extras --all-packages        # + all env packages (needed to train on them)
