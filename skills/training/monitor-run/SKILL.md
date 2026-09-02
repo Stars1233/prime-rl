@@ -152,6 +152,10 @@ All metrics print to the console log (and W&B when configured).
 | orchestrator | `off_policy/{mean,max}`, `off_policy/{in_flight,in_queue}/{mean,max}`, `off_policy/dropped` | per-step staleness of trained rollouts |
 | env server | event loop lag (min/mean/p90/p99/max), active task distribution | periodic |
 
+The trainer warns when batch wait time exceeds active trainer time. Add inference nodes when this warning persists. The orchestrator warns when policy wait time exceeds active orchestrator time. Add trainer nodes when this warning persists. The orchestrator also warns when it discards more than half of an episode window and reports stale, errored, and no-signal counts.
+
+`orchestrator.constant_trainer_batch_size` defaults to `true`. It keeps each rollout batch at `orchestrator.batch_size` effective episodes. Set it to `false` for faster collection with variable trainer batch sizes.
+
 For live vLLM stats, query Prometheus directly:
 
 ```bash
