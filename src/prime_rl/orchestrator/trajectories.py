@@ -166,6 +166,8 @@ def trace_to_samples(trace: vf.Trace, *, env_name: str = "") -> list[TrainingSam
                 ref_kl_weights=_loss_weights(branch, "ref_kl", trained_loss_nodes["ref_kl"]),
                 advantages=branch.advantages,
                 sampling_mask=_encode_sampling_mask(branch.sampling_mask, len(token_ids)),
+                trace_id=trace.id,
+                branch_index=branch.index,
             )
         )
     if not samples:

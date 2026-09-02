@@ -76,9 +76,15 @@ class TrainingSample(msgspec.Struct, array_like=True, gc=False, omit_defaults=Tr
     # samples without live rl member tokens (the trainer raises otherwise).
     advantages: list[float] | None = None
 
-    # Last field on purpose: array_like structs encode positionally, so appending
+    # Appended fields only: array_like structs encode positionally, so appending
     # keeps the wire layout of earlier fields stable across versions.
     sampling_mask: SamplingMask | None = None
+
+    # Identity of the branch this sample was built from, so the trainer can key
+    # its per-token annotations back to the rollout trace. ``None`` on synthetic
+    # samples (e.g. fake data).
+    trace_id: str | None = None
+    branch_index: int | None = None
 
 
 # Orchestrator -> Trainer
@@ -109,5 +115,11 @@ class MicroBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
     ce_weights: list[float] | None = None
     ref_kl_weights: list[float] | None = None
 
-    # See TrainingSample.sampling_mask; appended last for wire-layout stability.
+    # See TrainingSample.sampling_mask; appended for wire-layout stability.
     sampling_mask: SamplingMask | None = None
+
+    # Per-sequence branch identity, parallel to ``sequence_lengths`` (see
+    # TrainingSample.trace_id). ``""`` / ``-1`` mark an unknown sequence
+    # (e.g. a dummy micro batch). ``None`` when no packed sample carried one.
+    trace_ids: list[str] | None = None
+    branch_indices: list[int] | None = None

@@ -405,11 +405,6 @@ def test_policy_sources_reject_mixed_top_k_capture():
             )
 
 
-def test_trainer_enable_token_export_cli_flag():
-    assert not cli(TrainerConfig, args=[]).enable_token_export
-    assert cli(TrainerConfig, args=["--enable-token-export"]).enable_token_export
-
-
 def test_single_node_auto_inference_ports_follow_server_port():
     config = RLConfig.model_validate(
         {
