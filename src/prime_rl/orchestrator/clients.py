@@ -91,6 +91,13 @@ class InferenceClient:
         )
         self.eval_client = setup_client(client_config, client_type=eval_client_type)
         self._scorer = PrefillScorer()
+        # Managed routed deployments set admin_base_url so engine admin traffic
+        # bypasses the client-facing router. External and frozen clients do not.
+        self._session_client = (
+            setup_admin_clients(client_config.model_copy(update={"admin_base_url": None}))[0]
+            if client_config.admin_base_url is not None
+            else None
+        )
         self.model_name = model_name
 
     async def score(self, token_ids: list[int]) -> list[float]:
@@ -100,6 +107,26 @@ class InferenceClient:
 
     async def aclose(self) -> None:
         await self._scorer.aclose()
+        if self._session_client is not None:
+            await self._session_client.aclose()
+
+    async def finish_sessions(self, session_ids: list[str]) -> None:
+        """Release completed sessions when the client-facing router supports it."""
+        if self._session_client is None or not session_ids:
+            return
+
+        async def finish_session(session_id: str) -> None:
+            try:
+                await _admin_post(
+                    self._session_client,
+                    "/finish_session",
+                    timeout_s=5.0,
+                    params={"session_id": session_id},
+                )
+            except Exception as error:
+                get_logger().debug(f"Failed to release inference session {session_id}: {error!r}")
+
+        await asyncio.gather(*(finish_session(session_id) for session_id in session_ids))
 
 
 class AdminPlane:

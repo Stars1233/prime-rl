@@ -578,7 +578,10 @@ class Dispatcher:
             started_at=time.monotonic(),
         )
 
+        session_ids: set[str] = set()
+
         def on_delta(delta: dict) -> None:
+            session_ids.add(delta["trace"])
             first = not meta.live
             live.apply(meta, delta)
             self.queue_live({"delta": delta, "dispatch": live.dispatch_info(meta)})
@@ -587,15 +590,26 @@ class Dispatcher:
             if first and meta.live:
                 self.live_events.append(live.dispatched_event(meta))
 
-        task = asyncio.create_task(
-            env.run(
-                client=client,
-                model_name=model_name,
-                cache_salt=cache_salt,
-                task_data=group.task.data.model_dump(mode="json"),
-                on_delta=on_delta,
-            )
-        )
+        async def run_episode() -> vf.WireEpisode:
+            try:
+                episode = await env.run(
+                    client=client,
+                    model_name=model_name,
+                    cache_salt=cache_salt,
+                    task_data=group.task.data.model_dump(mode="json"),
+                    on_delta=on_delta,
+                )
+                session_ids.update(trace.id for trace in episode.traces)
+                return episode
+            finally:
+                cleanup = asyncio.create_task(clients.finish_sessions(sorted(session_ids)))
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    await cleanup
+                    raise
+
+        task = asyncio.create_task(run_episode())
         self.inflight[task] = meta
         self.live_events.append(live.pending_event(meta))
         return True
